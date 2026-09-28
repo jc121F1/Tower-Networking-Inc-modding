@@ -1,0 +1,17 @@
+{
+	"id": "powered-blade-rack-audit",
+	"name": "Powered Blade Rack Audit",
+	"authors": [ "modding-kit" ],
+	"version": "0.1.0",
+	"description": [
+		"Read-only audit of rack, blade, and power-controller scene state.",
+		"Does not transfer loads or change device power."
+	],
+	"links": {},
+	"dependencies": {
+		"tower-networking-inc": "^0.12.0",
+		"luajit-support": "~0.2.0"
+	},
+	"dependencies_optional": {},
+	"incompatibilities": {}
+}
