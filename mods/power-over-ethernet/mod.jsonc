@@ -1,0 +1,17 @@
+{
+	"id": "power-over-ethernet",
+	"name": "Power over Ethernet",
+	"authors": [ "modding-kit" ],
+	"version": "0.1.0",
+	"description": [
+		"Lets a powered network switch adopt the power load of an Ethernet-connected endpoint.",
+		"Uses the game's PowerController local-load API and never creates virtual power sockets."
+	],
+	"links": {},
+	"dependencies": {
+		"tower-networking-inc": "^0.12.0",
+		"luajit-support": "~0.2.0"
+	},
+	"dependencies_optional": {},
+	"incompatibilities": {}
+}
