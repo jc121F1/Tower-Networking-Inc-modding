@@ -3,7 +3,7 @@ name: Package release
 on:
   push:
     tags:
-      - "v*"
+      - "poe-v*"
 
 permissions:
   contents: write
