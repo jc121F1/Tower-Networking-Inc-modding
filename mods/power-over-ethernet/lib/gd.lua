@@ -1,5 +1,5 @@
 -- lib/gd.lua -- allocation-free reads across the sandbox boundary.
-
+-- credit to Tylerun, whose great Custom Devices Mod this was stolen from.
 local M = {}
 
 -- pcall takes arguments, so these are created once instead of per call.

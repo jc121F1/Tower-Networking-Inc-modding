@@ -9,6 +9,11 @@ local gd = require("lib.gd")
 local TOTAL_BUDGET_W = 120
 local PORT_BUDGET_W = 15
 local SCAN_PERIOD = 30
+-- Set to true when investigating PoE routing. Detailed snapshots are costly.
+local AUDIT = false
+local DIAG_MAX_DEVICES = 128
+local DIAG_MAX_EDGES = 256
+local DIAG_MAX_CANDIDATES = 256
 -- Use the game's local-load API. Do not create or move sockets: power sockets
 -- participate in physical cable simulation.
 local tick = 0
@@ -19,6 +24,9 @@ local power_links = {} -- endpoint Power instance ID -> controller load transfer
 local missing_scans = {} -- consecutive scans with no physical Ethernet cable
 local rejected_loads = {} -- last PoE load estimate reported for each over-limit endpoint
 local hover_patch = nil -- last visual-only correction to the player's hover label
+local hover_signal_label_id = nil
+local hover_signal_failed = false
+local hover_signal_busy = false
 
 local function log(fmt, ...)
 	print("[poe] " .. string.format(fmt, ...))
@@ -293,6 +301,77 @@ local function physical_ethernet_peers(devices)
 	return peers, cable_count, ports_by_device
 end
 
+local function log_scan_diagnostics(involved, edges, candidates, outcomes)
+	local active_links = 0
+	local switch_names = {}
+	for _ in pairs(power_links) do active_links = active_links + 1 end
+	log("diag tick=%d devices=%d edges=%d candidates=%d active_links=%d",
+		tick, #involved, #edges, #candidates, active_links)
+	for i = 1, math.min(#involved, DIAG_MAX_DEVICES) do
+		local device = involved[i]
+		if tonumber(gd.get(device, "device_hardware_class")) == 1 then
+			local name, id = gd.name(device), instance_id(device)
+			if switch_names[name] and switch_names[name] ~= id then
+				log("diag: switches share name=%s ids=%s,%s; source selection uses IDs",
+					name, switch_names[name], id)
+			else
+				switch_names[name] = id
+			end
+		end
+		local logic = gd.get(device, "logic_controller")
+		local power = gd.get(logic, "power")
+		local device_pc = gd.get(device, "power_controller")
+		local power_pc = gd.get(power, "controller")
+		local link = power and power_links[instance_id(power)]
+		local auxiliary = {}
+		if link then
+			for _, extra in ipairs(link.auxiliary_powers or {}) do
+				auxiliary[#auxiliary + 1] = string.format("%s:%s:%s",
+					tostring(instance_id(extra.power)), tostring(gd.get(extra.power, "is_powered")),
+					tostring(instance_id(gd.get(extra.power, "controller"))))
+			end
+		end
+		log("diag device=%s class=%s power=%s intent=%s manifest=%s os=%s load=%s power_pc=%s device_pc=%s supply=%s enabled=%s disabled=%s charge=%s/%s draw=%s poe_source=%s poe_pc=%s original_pc=%s aux=[%s]",
+			device_label(device), tostring(gd.get(device, "device_hardware_class")),
+			tostring(gd.get(power, "is_powered")), tostring(gd.get(power, "manifest_intent")),
+			tostring(gd.get(power, "can_manifest")), tostring(gd.get(logic, "os_running")),
+			tostring(gd.get(power, "current_load")), tostring(instance_id(power_pc)),
+			tostring(instance_id(device_pc)), tostring(gd.get(device_pc, "can_supply_power")),
+			tostring(gd.get(device_pc, "is_enabled_and_functional")),
+			tostring(gd.get(device_pc, "disabled")), tostring(gd.get(device_pc, "charges")),
+			tostring(gd.get(device_pc, "charge_capacity")),
+			tostring(gd.get(device_pc, "current_load")),
+			link and link.source_name or "-", tostring(link and instance_id(link.source_pc) or "-"),
+			tostring(link and instance_id(link.original_pc) or "-"), table.concat(auxiliary, ","))
+	end
+	if #involved > DIAG_MAX_DEVICES then
+		log("diag device list truncated: %d omitted", #involved - DIAG_MAX_DEVICES)
+	end
+	for i = 1, math.min(#edges, DIAG_MAX_EDGES) do
+		local edge = edges[i]
+		log("diag edge %s/%s <-> %s/%s cable=%s logical=%s up=%s/%s",
+			edge.a, edge.a_socket, edge.b, edge.b_socket, edge.cable,
+			tostring(edge.logical), tostring(edge.a_up), tostring(edge.b_up))
+	end
+	if #edges > DIAG_MAX_EDGES then
+		log("diag edge list truncated: %d omitted", #edges - DIAG_MAX_EDGES)
+	end
+	for i = 1, math.min(#candidates, DIAG_MAX_CANDIDATES) do
+		local item = candidates[i]
+		if tonumber(gd.get(item.target_device, "device_hardware_class")) == 1 then
+			log("diag switch-chain candidate source_node=%s target_node=%s",
+				tostring(instance_id(item.source)), tostring(instance_id(item.target_device)))
+		end
+		log("diag candidate source=%s source_pc=%s upstream_pc=%s target=%s watts=%s result=%s",
+			device_label(item.source), tostring(instance_id(item.source_pc)),
+			tostring(instance_id(item.source_upstream_pc)), device_label(item.target_device),
+			tostring(item.watts), tostring(outcomes[item] or "not-selected"))
+	end
+	if #candidates > DIAG_MAX_CANDIDATES then
+		log("diag candidate list truncated: %d omitted", #candidates - DIAG_MAX_CANDIDATES)
+	end
+end
+
 local function scan()
 	local devices = collect_devices()
 	if #devices == 0 then
@@ -303,10 +382,22 @@ local function scan()
 	end
 	local physical_peers, physical_cables, ports_by_device = physical_ethernet_peers(devices)
 	local candidates, candidate_seen = {}, {}
+	local involved, involved_seen, edges, edge_seen, outcomes = {}, {}, {}, {}, {}
+	local function mark_involved(device)
+		if not AUDIT then return end
+		local id = instance_id(device)
+		if id and not involved_seen[id] then
+			involved_seen[id] = true
+			involved[#involved + 1] = device
+		end
+	end
 	local active, budgets = {}, {}
 	local ethernet_ports, up_links, powered_switches, poe_supply_switches = 0, 0, 0, 0
 	local over_port_limit, over_switch_budget, edge_failures = 0, 0, 0
 	local unpowered_endpoints = 0
+	for _, link in pairs(power_links) do
+		if link.endpoint then mark_involved(link.endpoint) end
+	end
 
 	for _, device in ipairs(devices) do
 		local device_power = power_node(device)
@@ -332,20 +423,44 @@ local function scan()
 							source, target = other, device
 						end
 						if (tonumber(gd.get(source, "device_hardware_class")) or 0) == 1 then
+							mark_involved(source)
+							mark_involved(target)
+							if AUDIT then
+								local a_id, b_id = instance_id(sock), instance_id(peer)
+								if a_id and b_id then
+									local first, second = a_id, b_id
+									if first > second then first, second = second, first end
+									local edge_id = first .. "/" .. second
+									if not edge_seen[edge_id] then
+										edge_seen[edge_id] = true
+										local plug = gd.get(sock, "connection")
+										edges[#edges + 1] = {
+											a = instance_id(device), b = instance_id(other),
+											a_socket = a_id, b_socket = b_id,
+											cable = instance_id(gd.parent(plug)) or "-",
+											logical = logical_peer ~= nil,
+											a_up = gd.get(sock, "is_up"), b_up = gd.get(peer, "is_up"),
+										}
+									end
+								end
+							end
 							local source_power = power_node(source)
 							-- The switch's own PowerController is its PoE output. Its
 							-- Power.controller is the upstream mains/UPS circuit and must
 							-- never receive endpoint loads.
 							local source_pc = gd.get(source, "power_controller")
 							local source_upstream_pc = gd.get(source_power, "controller")
+							local source_id = instance_id(source)
+							local source_power_id = source_power and instance_id(source_power)
+							local source_is_poe_fed = source_power_id and power_links[source_power_id] ~= nil
 							local target_power = power_node(target)
 							local target_pc = target_power and gd.get(target_power, "controller")
 								or gd.get(target, "power_controller")
 							local target_id = target_power and instance_id(target_power)
 							local existing_link = target_id and power_links[target_id]
 							local same_existing_source = existing_link
-								and existing_link.source_name == gd.name(source)
-							local original_pc = same_existing_source and existing_link.original_pc or target_pc
+								and existing_link.source_id == source_id
+							local original_pc = existing_link and existing_link.original_pc or target_pc
 							local watts = endpoint_load_watts(target, target_power, original_pc)
 							if existing_link and existing_link.auxiliary_powers then
 								local live_watts = tonumber(gd.get(target_power, "current_load")) or 0
@@ -354,18 +469,24 @@ local function scan()
 								end
 								if live_watts > (watts or 0) then watts = live_watts end
 							end
-							if source_power and source_pc and target_power and target_pc
-								and target_id
+							if source_power and source_pc and source_id and target_power and target_pc
+								and target_id and not source_is_poe_fed
+								-- The original controller's disabled flag appears to track the
+								-- device power switch. Do not bypass a disabled controller.
+								and gd.get(original_pc, "disabled") == false
+								-- A powered endpoint needs no PoE. An existing PoE link is
+								-- retained only for its current source until it is removed.
+								and (existing_link and same_existing_source or not existing_link and not powered_now(target_power))
 								and (source_pc ~= original_pc or same_existing_source)
 								and gd.get(source_pc, "can_supply_power") == true
 								and powered_now(source_power) then
-								local candidate_key = target_id .. "|" .. gd.name(source)
+								local candidate_key = target_id .. "|" .. source_id
 								if not candidate_seen[candidate_key] then
 									candidate_seen[candidate_key] = true
 									candidates[#candidates + 1] = {
 										target = target_power, target_device = target,
 										original_pc = original_pc, target_id = target_id,
-											source = source, source_pc = source_pc,
+										source = source, source_id = source_id, source_pc = source_pc,
 											source_upstream_pc = source_upstream_pc,
 										watts = watts, original_powered = powered_now(target_power),
 									}
@@ -379,7 +500,7 @@ local function scan()
 	end
 
 	table.sort(candidates, function(a, b)
-		if a.target_id == b.target_id then return gd.name(a.source) < gd.name(b.source) end
+		if a.target_id == b.target_id then return a.source_id < b.source_id end
 		return a.target_id < b.target_id
 	end)
 
@@ -390,6 +511,7 @@ local function scan()
 			local budget = key and (budgets[key] or 0) or TOTAL_BUDGET_W
 			local watts = item.watts
 			if not watts or watts > PORT_BUDGET_W then
+				outcomes[item] = "over-port-limit"
 				over_port_limit = over_port_limit + 1
 				local reported = watts or -1
 				if rejected_loads[item.target_id] ~= reported then
@@ -398,11 +520,12 @@ local function scan()
 					rejected_loads[item.target_id] = reported
 				end
 			elseif budget + watts > TOTAL_BUDGET_W then
+				outcomes[item] = "over-switch-budget"
 				over_switch_budget = over_switch_budget + 1
 			else
 				rejected_loads[item.target_id] = nil
 				local link = power_links[item.target_id]
-				if link and link.source_name ~= gd.name(item.source) then
+				if link and link.source_id ~= item.source_id then
 					restore_power_load(link)
 					power_links[item.target_id] = nil
 					link = nil
@@ -411,8 +534,10 @@ local function scan()
 					local transferred, transfer_method = transfer_power_load(
 						item.target, item.source_pc, item.original_pc)
 					if transferred then
+						outcomes[item] = "transferred"
 						link = {
-							source_name = gd.name(item.source), source_pc = item.source_pc,
+							source_name = gd.name(item.source), source_id = item.source_id,
+							source_pc = item.source_pc,
 							original_pc = item.original_pc, power = item.target,
 							endpoint = item.target_device,
 							original_powered = item.original_powered,
@@ -427,6 +552,7 @@ local function scan()
 							tostring(instance_id(item.source_upstream_pc)),
 							power_state_snapshot(item.target, item.source_pc, item.original_pc))
 					else
+						outcomes[item] = "transfer-failed"
 						edge_failures = edge_failures + 1
 						log("could not transfer load %s -> %s: %s (source can_supply_power=%s, controller=%s, locals_contains_power=%s)",
 							gd.name(item.source), device_label(item.target_device),
@@ -437,6 +563,7 @@ local function scan()
 					end
 				end
 				if link then
+					if not outcomes[item] then outcomes[item] = "existing-link" end
 					missing_scans[item.target_id] = nil
 					if powered_now(item.target) then
 						link.last_powered = true
@@ -459,6 +586,8 @@ local function scan()
 					active[item.target_id] = true
 				end
 			end
+		else
+			outcomes[item] = "another-source-selected"
 		end
 	end
 
@@ -468,6 +597,10 @@ local function scan()
 		else
 			missing_scans[id] = (missing_scans[id] or 0) + 1
 			if missing_scans[id] >= 1 then
+				if gd.get(link.original_pc, "disabled") == true then
+					log("PoE removed because endpoint's original power controller is disabled: %s",
+						link.endpoint and device_label(link.endpoint) or id)
+				end
 				restore_power_load(link)
 				power_links[id] = nil
 				missing_scans[id] = nil
@@ -489,6 +622,10 @@ local function scan()
 		active_count, unpowered_endpoints, over_port_limit, over_switch_budget, edge_failures)
 		log("%s", summary)
 		last_scan_summary = summary_key
+	end
+	if AUDIT then
+		local ok, reason = pcall(log_scan_diagnostics, involved, edges, candidates, outcomes)
+		if not ok then log("diagnostic snapshot failed: %s", tostring(reason)) end
 	end
 end
 
@@ -556,6 +693,38 @@ local function update_hover_power_text()
 	end
 end
 
+local function on_hover_label_finished()
+	if hover_signal_busy or not ready or not (next(power_links) or hover_patch) then return end
+	hover_signal_busy = true
+	-- Assigning RichTextLabel.text can emit finished again. The guard keeps
+	-- the callback from re-entering while the green label is applied.
+	local ok, err = pcall(update_hover_power_text)
+	hover_signal_busy = false
+	if not ok and not hover_signal_failed then
+		log("hover signal correction failed: %s", tostring(err))
+		hover_signal_failed = true
+	end
+end
+
+local function connect_hover_label_signal()
+	if hover_signal_failed then return end
+	local camera = ModApiV1.get_player_camera()
+	local mouse = gd.get(camera, "mp_mouse")
+	local label = gd.get(mouse, "hovertxt")
+	local id = instance_id(label)
+	if not id or id == hover_signal_label_id then return end
+	local ok, result = pcall(function()
+		return label.connect("finished", on_hover_label_finished)
+	end)
+	if ok and tonumber(result) == 0 then
+		hover_signal_label_id = id
+		log("hover label finished signal connected")
+	else
+		hover_signal_failed = true
+		log("hover label finished signal unavailable: %s", tostring(result))
+	end
+end
+
 function on_game_tick()
 	collectgarbage("stop")
 	tick = tick + 1
@@ -564,6 +733,7 @@ function on_game_tick()
 	-- sandbox bridge, which is a fatal std::bad_cast rather than a Lua exception.
 	if ready and tick >= scan_after and tick % SCAN_PERIOD == 0 then
 		pcall(scan)
+		pcall(connect_hover_label_signal)
 		if next(power_links) or hover_patch then
 			pcall(update_hover_power_text)
 		end
@@ -578,8 +748,12 @@ function on_game_state_ready()
 	missing_scans = {}
 	rejected_loads = {}
 	hover_patch = nil
+	hover_signal_label_id = nil
+	hover_signal_failed = false
+	hover_signal_busy = false
 	last_scan_summary = nil
 	ready = true
 	scan_after = tick + 120
 	log("world ready; PoE scan starts after 120 ticks")
+	pcall(connect_hover_label_signal)
 end
