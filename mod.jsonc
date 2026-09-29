@@ -1,0 +1,18 @@
+{
+	"id": "rack-ups-power-test",
+	"name": "Rack UPS Power Test",
+	"authors": [ "modding-kit" ],
+	"version": "0.1.0",
+	"description": [
+		"Test-only rack power bridge for the Rack UPS Test and FireWatch ES4A.",
+		"Transfers power only while both are locked into the same rack Mount.",
+		"Restores the FireWatch's original controller when the rack relationship ends."
+	],
+	"links": {},
+	"dependencies": {
+		"tower-networking-inc": "^0.12.0",
+		"luajit-support": "~0.2.0"
+	},
+	"dependencies_optional": {},
+	"incompatibilities": {}
+}
