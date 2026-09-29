@@ -1,26 +1,56 @@
 -- Reversible rack power proof of concept.
--- Rack UPS Test (R500) can power eligible devices in the same locked Mount.
+-- A supported UPS can power eligible devices in the same locked Mount.
 local gd = require("lib.gd")
 
 local SCAN_PERIOD = 30
 local START_DELAY = 120
 local MIN_CHARGE_MULTIPLIER = 10
 local tick, ready, scan_after = 0, false, math.huge
+local active_world_id = nil
 local links = {} -- target device id -> reversible transfer record
+local link_ids, tracked_link_ids = {}, {}
 local last_rejection = {}
 local last_mount_state = {}
-local last_overlap_state = {}
+local last_source_selection = {}
 local hover_patch = nil
-local hover_signal_label_id = nil
-local hover_signal_failed = false
-local hover_signal_busy = false
+local array_probe_sequence = 0
+local array_probe_logged = 0
+local ARRAY_PROBE_BUDGET = 240
+local array_probe_budget_reported = false
+local NODE_ARRAY_SAMPLE_PERIOD = 32
 
 local function log(fmt, ...)
 	print("[rack-ups-test] " .. string.format(fmt, ...))
 end
 
+-- Emit a bounded checkpoint immediately before each Godot Array traversal.
+-- If the sandbox faults while iterating, the last checkpoint identifies the
+-- caller and owning object without dumping the array or retaining its entries.
+local function audit_array_iteration(site, owner, array, fn, detail)
+	array_probe_sequence = array_probe_sequence + 1
+	local should_log = site ~= "node_children"
+		or array_probe_sequence <= 120
+		or array_probe_sequence % NODE_ARRAY_SAMPLE_PERIOD == 0
+	if should_log and array_probe_logged < ARRAY_PROBE_BUDGET then
+		array_probe_logged = array_probe_logged + 1
+		log("array checkpoint op=%d logged=%d tick=%d site=%s owner=%s#%s detail=%s",
+			array_probe_sequence, array_probe_logged, tick, site, gd.name(owner),
+			tostring(gd.id(owner) or "?"), tostring(detail or "-"))
+	elseif should_log and not array_probe_budget_reported then
+		array_probe_budget_reported = true
+		log("array checkpoint budget exhausted at %d; further array probes suppressed", ARRAY_PROBE_BUDGET)
+	end
+	gd.each(array, fn)
+end
+
 local function has(text, fragment)
 	return string.find(string.lower(tostring(text or "")), string.lower(fragment), 1, true) ~= nil
+end
+
+local function is_ups_source(device)
+	local product = gd.get(device, "product_name")
+	return has(product, "rack ups test")
+		or has(product, "mountable tenabolt ups2e")
 end
 
 local function label(device)
@@ -29,8 +59,7 @@ local function label(device)
 end
 
 local function log_mount_state(device, reason, force)
-	local product = tostring(gd.get(device, "product_name") or "")
-	if not (has(product, "rack ups test") or gd.get(device, "logic_controller") ~= nil) then return end
+	if not (is_ups_source(device) or gd.get(device, "logic_controller") ~= nil) then return end
 	local id = tostring(gd.id(device) or "?")
 	local area = gd.get(device, "base_mounted_area")
 	local device_pc = gd.get(device, "power_controller")
@@ -45,45 +74,6 @@ local function log_mount_state(device, reason, force)
 	if force or last_mount_state[id] ~= state then
 		last_mount_state[id] = state
 		log("mount audit reason=%s %s", reason, state)
-	end
-end
-
--- Compare the rack's Area2D body list with the custom UPS's own mount state.
--- This distinguishes "body is overlapping but the mount link is missing" from
--- "the rack does not see the body" without walking the scene tree.
-local function log_mount_overlap(area, target, source)
-	if not area or not target or not source then return end
-	local bodies = gd.call(area, "get_overlapping_bodies")
-	if bodies == nil then
-		local key = tostring(gd.id(area) or "?")
-		if last_overlap_state[key] ~= "unavailable" then
-			last_overlap_state[key] = "unavailable"
-			log("mount overlap audit mount=%s#%s query=unavailable", gd.name(area), key)
-		end
-		return
-	end
-	local ids, source_seen = {}, false
-	gd.each(bodies, function(_, body)
-		local id = gd.id(body)
-		if id then
-			ids[#ids + 1] = gd.name(body) .. "#" .. id
-			if id == gd.id(source) then source_seen = true end
-		end
-	end)
-	table.sort(ids)
-	local state = table.concat({ table.concat(ids, ","), tostring(source_seen),
-		tostring(gd.get(source, "base_mounted_area") == area),
-		tostring(gd.get(source, "collision_layer")), tostring(gd.get(source, "collision_mask")),
-		tostring(gd.get(source, "freeze")), tostring(gd.get(source, "is_mount_locked")) }, "|")
-	local key = tostring(gd.id(area) or "?")
-	if last_overlap_state[key] ~= state then
-		last_overlap_state[key] = state
-		log("mount overlap audit mount=%s#%s target=%s source=%s source_in_overlaps=%s source_area_matches=%s collision_layer=%s collision_mask=%s freeze=%s locked=%s bodies=[%s]",
-			gd.name(area), key, label(target), label(source), tostring(source_seen),
-			tostring(gd.get(source, "base_mounted_area") == area),
-			tostring(gd.get(source, "collision_layer")), tostring(gd.get(source, "collision_mask")),
-			tostring(gd.get(source, "freeze")), tostring(gd.get(source, "is_mount_locked")),
-			table.concat(ids, ","))
 	end
 end
 
@@ -105,9 +95,12 @@ end
 local function local_count(pc, power)
 	local want, count = gd.id(power), 0
 	if not pc or not want then return 0 end
-	gd.each(gd.get(pc, "locals"), function(_, item)
+	-- `locals` is exposed as an iterable Godot array in the working PoE path;
+	-- it is not a Node with a `count(power)` method. Keep this probe aligned
+	-- with PoE and avoid emitting a Godot error on every scan.
+	audit_array_iteration("controller_locals", pc, gd.get(pc, "locals"), function(_, item)
 		if gd.id(item) == want then count = count + 1 end
-	end)
+	end, "power=" .. want)
 	return count
 end
 
@@ -172,24 +165,55 @@ local function restore_power(item, source_alive)
 	end
 end
 
-local function restore_link(link, alive)
+-- Link records hold only values. Resolve nodes from a live device each time
+-- they are needed, so a world change cannot strand GDObject wrappers in links.
+local function resolve_link(link, by_id)
+	local target = by_id[link.target_id]
+	local source = by_id[link.source_id]
+	local source_pc = source and gd.get(source, "power_controller") or nil
+	if source_pc and gd.id(source_pc) ~= link.source_pc_id then source_pc = nil end
+	local powers = {}
+	if target then
+		for _, saved in ipairs(link.powers) do
+			local power = gd.call(target, "get_node_or_null", saved.power_path)
+			local original_pc = gd.call(target, "get_node_or_null", saved.original_pc_path)
+			if gd.id(power) == saved.power_id and gd.id(original_pc) == saved.original_pc_id then
+				powers[#powers + 1] = {
+					power = power, source_pc = source_pc, original_pc = original_pc,
+					original_powered = saved.original_powered, primary = saved.primary,
+				}
+			elseif not link.resolve_warned then
+				link.resolve_warned = true
+				log("link node resolution failed target=%s power=%s original_pc=%s",
+					link.target_label, saved.power_id, saved.original_pc_id)
+			end
+		end
+	end
+	return source_pc, powers
+end
+
+local function restore_link(link, alive, by_id)
 	local target_alive = link.target_id and alive[link.target_id]
 	local source_alive = link.source_id and alive[link.source_id]
 	if target_alive then
-		for i = #link.powers, 1, -1 do restore_power(link.powers[i], source_alive) end
+		local source_pc, powers = resolve_link(link, by_id)
+		if #powers ~= #link.powers then return false end
+		for i = #powers, 1, -1 do restore_power(powers[i], source_alive and source_pc ~= nil) end
 	end
 	log("restored link target=%s source=%s target_alive=%s source_alive=%s reason=%s",
 		link.target_label, link.source_label, tostring(target_alive == true),
 		tostring(source_alive == true), tostring(link.restore_reason or "rack condition ended"))
+	return true
 end
 
-local function link_has_power(link)
-	if not link or not link.target or not link.source_pc then return false end
-	local target_pc = gd.get(link.target, "power_controller")
+local function link_has_power(link, target)
+	if not link or not target then return false end
+	local target_pc = gd.get(target, "power_controller")
 	if not target_pc or gd.get(target_pc, "disabled") ~= false then return false end
 	for _, item in ipairs(link.powers) do
-		if item.primary and gd.get(item.power, "is_powered") == true
-			and gd.id(gd.get(item.power, "controller")) == gd.id(link.source_pc) then
+		local power = item.primary and gd.call(target, "get_node_or_null", item.power_path) or nil
+		if power and gd.id(power) == item.power_id and gd.get(power, "is_powered") == true
+			and gd.id(gd.get(power, "controller")) == link.source_pc_id then
 			return true
 		end
 	end
@@ -220,7 +244,7 @@ local function update_hover_power_text()
 	local text = gd.get(hover_label, "text")
 	if type(text) ~= "string" then return end
 	local link = links[device_id]
-	local powered = link_has_power(link)
+	local powered = link_has_power(link, device)
 	if hover_patch and hover_patch.device_id == device_id
 		and text == hover_patch.patched and not powered then
 		gd.set(hover_label, "text", hover_patch.original)
@@ -244,37 +268,6 @@ local function update_hover_power_text()
 			log("corrected hover power label for %s", link.target_label)
 			link.hover_logged = true
 		end
-	end
-end
-
-local function on_hover_label_finished()
-	if hover_signal_busy or not ready or not (next(links) or hover_patch) then return end
-	hover_signal_busy = true
-	-- Setting RichTextLabel.text can emit finished again; guard re-entry.
-	local ok, err = pcall(update_hover_power_text)
-	hover_signal_busy = false
-	if not ok and not hover_signal_failed then
-		log("hover signal correction failed: %s", tostring(err))
-		hover_signal_failed = true
-	end
-end
-
-local function connect_hover_label_signal()
-	if hover_signal_failed then return end
-	local camera = ModApiV1.get_player_camera()
-	local mouse = gd.get(camera, "mp_mouse")
-	local hover_label = gd.get(mouse, "hovertxt")
-	local id = gd.id(hover_label)
-	if not id or id == hover_signal_label_id then return end
-	local ok, result = pcall(function()
-		return hover_label.connect("finished", on_hover_label_finished)
-	end)
-	if ok and tonumber(result) == 0 then
-		hover_signal_label_id = id
-		log("hover label finished signal connected")
-	else
-		hover_signal_failed = true
-		log("hover label finished signal unavailable: %s", tostring(result))
 	end
 end
 
@@ -350,9 +343,15 @@ end
 
 local function collect_devices()
 	local devices = {}
-	local ok, all = pcall(function() return ModApiV1.get_devices() end)
-	if not ok or not all then return devices end
-	gd.each(all, function(_, d) devices[#devices + 1] = d end)
+	local ok, all_devices = pcall(function() return ModApiV1.get_devices() end)
+	if not ok or not all_devices then return devices end
+	audit_array_iteration("mod_api_devices", nil, all_devices, function(_, device)
+		if gd.get(device, "power_controller") ~= nil
+			or gd.get(device, "logic_controller") ~= nil
+			or is_ups_source(device) then
+			devices[#devices + 1] = device
+		end
+	end)
 	return devices
 end
 
@@ -383,9 +382,20 @@ local function find_power_nodes(device, source_pc)
 	end
 	local logic = gd.get(device, "logic_controller")
 	if logic then add(gd.get(logic, "power")) end
-	gd.each(gd.find_named(device, "Power"), function(_, node) add(node) end)
-	gd.each(gd.find_named(device, "*Light*"), function(_, node) add(gd.get(node, "power")) end)
-	gd.each(gd.find_named(device, "*Switch*"), function(_, node) add(gd.get(node, "power")) end)
+	-- Traverse with get_children (the same path used by the rack audit) instead
+	-- of find_children's recursive Array result, which faults after save reloads.
+	local pending = {}
+	audit_array_iteration("device_children", device, gd.call(device, "get_children"),
+		function(_, child) pending[#pending + 1] = child end)
+	while #pending > 0 do
+		local node = pending[#pending]
+		pending[#pending] = nil
+		local name = gd.name(node)
+		if name == "Power" then add(node)
+		elseif has(name, "light") or has(name, "switch") then add(gd.get(node, "power")) end
+		audit_array_iteration("node_children", node, gd.call(node, "get_children"),
+			function(_, child) pending[#pending + 1] = child end)
+	end
 	return found
 end
 
@@ -425,47 +435,71 @@ local function transfer_target(source, target, source_area)
 	if watts <= 0 or not source_rate then return nil, "unknown load or UPS output rate" end
 	if watts > source_rate or current_load + watts > source_rate then return nil, "estimated load exceeds UPS output rate" end
 	if charges < watts * MIN_CHARGE_MULTIPLIER then return nil, "UPS charge below 10x estimated load reserve" end
+	-- Resolve paths before changing any controller. NodePath results are Lua
+	-- strings in this bridge, and remain relative to the target if it moves.
+	local prepared = {}
+	for _, candidate in ipairs(powers) do
+		local power_path = gd.call(target, "get_path_to", candidate.power)
+		local original_pc_path = gd.call(target, "get_path_to", candidate.original_pc)
+		if type(power_path) ~= "string" or power_path == ""
+			or type(original_pc_path) ~= "string" or original_pc_path == "" then
+			return nil, "could not resolve relative Power/controller paths"
+		end
+		prepared[#prepared + 1] = {
+			power = candidate.power, original_pc = candidate.original_pc,
+			power_path = power_path, original_pc_path = original_pc_path,
+		}
+	end
 	local link = {
 		target_id = gd.id(target), source_id = gd.id(source), source_area_id = gd.id(source_area),
-		target = target, source = source, target_label = label(target), source_label = label(source),
-		source_pc = source_pc, original_pc = primary.original_pc,
+		target_label = label(target), source_label = label(source), source_pc_id = gd.id(source_pc),
 		primary_power_id = gd.id(primary.power), powers = {}, estimated_watts = watts,
 	}
-	for _, candidate in ipairs(powers) do
+	local transferred = {}
+	for _, candidate in ipairs(prepared) do
 		local power, original_pc = candidate.power, candidate.original_pc
-		local item = { power = power, source_pc = source_pc, original_pc = original_pc,
+		local item = { power_id = gd.id(power), original_pc_id = gd.id(original_pc),
+			power_path = candidate.power_path, original_pc_path = candidate.original_pc_path,
 			original_powered = gd.get(power, "is_powered") == true,
 			primary = gd.id(power) == link.primary_power_id }
 		local ok, reason = transfer_one(power, source_pc, original_pc)
 		if not ok then
-			for i = #link.powers, 1, -1 do restore_power(link.powers[i], true) end
+			for i = #transferred, 1, -1 do restore_power(transferred[i], true) end
 			return nil, "load " .. tostring(gd.id(power)) .. " transfer failed: " .. tostring(reason)
 		end
+		transferred[#transferred + 1] = {
+			power = power, source_pc = source_pc, original_pc = original_pc,
+			original_powered = item.original_powered,
+		}
 		link.powers[#link.powers + 1] = item
 		log("load transfer target=%s source=%s %s source_memberships=%d", link.target_label,
 			link.source_label, snapshot(power, source_pc), local_count(source_pc, power))
 	end
+	local resolved_source, resolved_powers = resolve_link(link,
+		{ [link.target_id] = target, [link.source_id] = source })
+	if not resolved_source or #resolved_powers ~= #link.powers then
+		for i = #transferred, 1, -1 do restore_power(transferred[i], true) end
+		return nil, "relative Power/controller paths failed to resolve"
+	end
 	links[link.target_id] = link
+	if not tracked_link_ids[link.target_id] then
+		link_ids[#link_ids + 1] = link.target_id
+		tracked_link_ids[link.target_id] = true
+	end
 	log("rack power ON target=%s source=%s rack_mount=%s estimated_w=%d loads=%d",
 		link.target_label, link.source_label, tostring(link.source_area_id), watts, #link.powers)
 	return link
 end
 
-local function audit_link_load(link)
-	local source_pc = link.source_pc
+local function audit_link_load(link, by_id)
+	local source_pc, powers = resolve_link(link, by_id)
+	if not source_pc or #powers ~= #link.powers then return end
 	local source_state = string.format("source_pc=%s current_load=%s displayed_load=%s charge=%s/%s rate=%s",
 		tostring(gd.id(source_pc)), tostring(gd.get(source_pc, "current_load")),
 		tostring(gd.get(source_pc, "displayed_load")), tostring(gd.get(source_pc, "charges")),
 		tostring(gd.get(source_pc, "charge_capacity")), tostring(gd.get(source_pc, "charge_rate")))
-	local locals = {}
-	gd.each(gd.get(source_pc, "locals"), function(_, power)
-		locals[#locals + 1] = string.format("%s:load=%s:powered=%s:controller=%s",
-			tostring(gd.id(power)), tostring(gd.get(power, "current_load")),
-			tostring(gd.get(power, "is_powered")), tostring(gd.id(gd.get(power, "controller"))))
-	end)
-	table.sort(locals)
 	local transferred = {}
-	for _, item in ipairs(link.powers) do
+	for _, item in ipairs(powers) do
 		local power = item.power
 		transferred[#transferred + 1] = string.format("%s:load=%s:powered=%s:controller=%s",
 			tostring(gd.id(power)), tostring(gd.get(power, "current_load")),
@@ -473,7 +507,7 @@ local function audit_link_load(link)
 	end
 	table.sort(transferred)
 	local original_controllers, controller_seen = {}, {}
-	for _, item in ipairs(link.powers) do
+	for _, item in ipairs(powers) do
 		local original_pc = item.original_pc
 		local original_id = gd.id(original_pc)
 		if original_id and not controller_seen[original_id] then
@@ -485,13 +519,11 @@ local function audit_link_load(link)
 	end
 	table.sort(original_controllers)
 	local original_state = "original_controllers=[" .. table.concat(original_controllers, ",") .. "]"
-	local signature = table.concat({ source_state, table.concat(locals, ","),
-		 table.concat(transferred, ","), original_state }, " | ")
+	local signature = table.concat({ source_state, table.concat(transferred, ","), original_state }, " | ")
 	if signature ~= link.last_load_audit then
 		link.last_load_audit = signature
-		log("load audit target=%s %s source_locals=[%s] transferred=[%s] %s",
-			link.target_label, source_state, table.concat(locals, ","),
-			table.concat(transferred, ","), original_state)
+		log("load audit target=%s %s transferred=[%s] %s",
+			link.target_label, source_state, table.concat(transferred, ","), original_state)
 	end
 end
 
@@ -502,20 +534,53 @@ local function reject_once(key, message)
 	end
 end
 
+local function source_is_active(source)
+	local device, pc = source.device, gd.get(source.device, "power_controller")
+	return gd.get(device, "is_mount_locked") == true
+		and pc ~= nil
+		and gd.get(pc, "can_supply_power") == true
+		and gd.get(pc, "is_enabled_and_functional") == true
+		and gd.get(pc, "disabled") == false
+		and (tonumber(gd.get(pc, "charges")) or 0) > 0
+end
+
+local function select_source(matching, area_id)
+	local eligible, candidate_ids = {}, {}
+	for _, source in ipairs(matching) do
+		local id = gd.id(source.device)
+		candidate_ids[#candidate_ids + 1] = tostring(id or "?")
+		if source_is_active(source) then eligible[#eligible + 1] = source end
+	end
+	-- Device discovery order is usually stable, but sort explicitly so duplicated
+	-- UPS devices do not make targets oscillate between power controllers.
+	table.sort(eligible, function(a, b)
+		return (tonumber(gd.id(a.device)) or math.huge) < (tonumber(gd.id(b.device)) or math.huge)
+	end)
+	local selected = eligible[1]
+	local signature = table.concat(candidate_ids, ",") .. "|selected="
+		.. tostring(selected and gd.id(selected.device) or "none")
+	local key = tostring(area_id or "?")
+	if #matching > 1 and last_source_selection[key] ~= signature then
+		log("multiple UPS devices in mount=%s candidates=[%s] eligible=%d selected=%s; other UPS units left idle",
+			key, table.concat(candidate_ids, ","), #eligible,
+			tostring(selected and gd.id(selected.device) or "none"))
+	end
+	last_source_selection[key] = signature
+	return selected
+end
+
 local function scan()
 	local devices = collect_devices()
 	if #devices == 0 then return end
-	local alive, sources, ups_devices, targets, by_target = {}, {}, {}, {}, {}
+	local alive, by_id, sources, targets, by_target = {}, {}, {}, {}, {}
 	for _, device in ipairs(devices) do
 		local id = gd.id(device)
-		if id then alive[id] = true end
-		local product = tostring(gd.get(device, "product_name") or "")
+		if id then alive[id], by_id[id] = true, device end
 		log_mount_state(device, "scan", false)
-		if has(product, "rack ups test") then ups_devices[#ups_devices + 1] = device end
 		local area = gd.get(device, "base_mounted_area")
 		if area and gd.name(area) == "Mount" then
 			local area_id = gd.id(area)
-			if has(product, "rack ups test") then
+			if is_ups_source(device) then
 				sources[#sources + 1] = { device = device, area = area, area_id = area_id }
 			elseif gd.get(device, "power_controller") ~= nil
 				or gd.get(device, "logic_controller") ~= nil then
@@ -530,75 +595,112 @@ local function scan()
 		for _, source in ipairs(sources) do
 			if source.area_id == area_id then matching[#matching + 1] = source end
 		end
-		if #matching > 0 then log_mount_overlap(target.area, target.device, matching[1].device)
-		elseif #ups_devices > 0 then log_mount_overlap(target.area, target.device, ups_devices[1]) end
 		local link = links[target_id]
 		local target_locked = gd.get(target.device, "is_mount_locked") == true
-		if #matching ~= 1 then
-			if link then link.restore_reason = "no unique UPS in the same rack"; restore_link(link, alive); links[target_id] = nil end
-			reject_once(key, #matching == 0 and "no Rack UPS Test in same Mount" or "multiple UPS units in same Mount")
-		elseif not target_locked or gd.get(matching[1].device, "is_mount_locked") ~= true then
-			if link then link.restore_reason = "source or target unlocked"; restore_link(link, alive); links[target_id] = nil end
-			reject_once(key, "source and target must both be locked")
+		local source_record = select_source(matching, area_id)
+		if #matching == 0 then
+			if link then link.restore_reason = "no UPS in the same rack"; if restore_link(link, alive, by_id) then links[target_id] = nil end end
+			reject_once(key, "no supported UPS in same Mount")
+		elseif not target_locked then
+			if link then link.restore_reason = "source or target unlocked"; if restore_link(link, alive, by_id) then links[target_id] = nil end end
+			reject_once(key, "target must be locked")
+		elseif not source_record then
+			if link then link.restore_reason = "no eligible locked UPS in the same rack"; if restore_link(link, alive, by_id) then links[target_id] = nil end end
+			reject_once(key, "UPS must be locked, enabled, functional, and charged")
 		else
-			local source = matching[1].device
+			local source = source_record.device
 			local source_pc = gd.get(source, "power_controller")
 			local target_pc = gd.get(target.device, "power_controller")
-			local source_active = source_pc ~= nil and gd.get(source_pc, "can_supply_power") == true
-			if source_active then
-				source_active = gd.get(source_pc, "is_enabled_and_functional") == true
-					and gd.get(source_pc, "disabled") == false
-					and (tonumber(gd.get(source_pc, "charges")) or 0) > 0
-			end
 			if link and (link.source_id ~= gd.id(source) or link.source_area_id ~= area_id) then
-				link.restore_reason = "source or rack changed"; restore_link(link, alive); links[target_id] = nil; link = nil
+				link.restore_reason = "source or rack changed"
+				if restore_link(link, alive, by_id) then links[target_id] = nil; link = nil end
 			end
 			if not target_pc or gd.get(target_pc, "disabled") ~= false then
-				if link then link.restore_reason = "device power switch is disabled"; restore_link(link, alive); links[target_id] = nil end
+				if link then link.restore_reason = "device power switch is disabled"; if restore_link(link, alive, by_id) then links[target_id] = nil end end
 				reject_once(key, "device power controller is disabled or unknown")
-			elseif not source_active then
-				if link then link.restore_reason = "UPS no longer supplying power"; restore_link(link, alive); links[target_id] = nil end
-				reject_once(key, "UPS must be enabled, charged, and can_supply_power=true")
 			elseif not link then
 				last_rejection[key] = nil
 				local created, reason = transfer_target(source, target.device, target.area)
 				if not created then reject_once(key, reason) else by_target[target_id] = true end
 			else
 				last_rejection[key] = nil
-				audit_link_load(link)
+				audit_link_load(link, by_id)
 				by_target[target_id] = true
 			end
 		end
 	end
-	for id, link in pairs(links) do
-		if not alive[id] then
-			log("dropping stale link wrappers target=%s source=%s (device removed)", link.target_label, link.source_label)
+	-- Use the stable ID list here: the sandbox faulted in LuaJIT's table
+	-- next iterator just after completed load audits on every linked scan.
+	for i = #link_ids, 1, -1 do
+		local id = link_ids[i]
+		local link = links[id]
+		if link and not alive[id] then
+			log("dropping stale link record target=%s source=%s (device removed)", link.target_label, link.source_label)
 			links[id] = nil
-		elseif not by_target[id] then
+		elseif link and not by_target[id] then
 			link.restore_reason = "target no longer qualifies in a shared locked rack Mount"
-			restore_link(link, alive)
-			links[id] = nil
+			if restore_link(link, alive, by_id) then links[id] = nil end
+		end
+		if not links[id] then
+			tracked_link_ids[id] = nil
+			table.remove(link_ids, i)
 		end
 	end
 end
 
+local function current_world_id()
+	local ok, world = pcall(function() return ModApiV1.get_game_world() end)
+	if not ok or not world then return nil end
+	-- get_game_world may still hand back the outgoing wrapper during a scene
+	-- transition. Do not treat it as usable until the node remains in the tree.
+	if gd.call(world, "is_inside_tree") ~= true then return nil end
+	return gd.id(world)
+end
+
+local function discard_stale_world_state(reason)
+	-- A world transition frees these wrappers. Drop references without calling
+	-- controller methods, then wait for on_game_state_ready to establish the
+	-- replacement world.
+	links, link_ids, tracked_link_ids = {}, {}, {}
+	last_rejection, last_mount_state = {}, {}
+	hover_patch = nil
+	active_world_id = nil
+	ready = false
+	log("suspending scans during world transition: %s", reason)
+end
+
+local function world_is_current()
+	local world_id = current_world_id()
+	if not world_id then
+		if active_world_id ~= nil or ready then discard_stale_world_state("game world unavailable") end
+		return false
+	end
+	if active_world_id and world_id ~= active_world_id then
+		discard_stale_world_state("world instance changed")
+		return false
+	end
+	if not active_world_id then active_world_id = world_id end
+	return ready
+end
+
 function on_mod_load()
-	-- Older builds of this test mod stopped the collector on every tick. Restart
-	-- it once on load so a hot reload cannot inherit the stopped-GC state.
-	local gc_ok, gc_err = pcall(collectgarbage, "restart")
-	log("Lua garbage collector restart=%s%s", tostring(gc_ok),
-		gc_ok and "" or (" error=" .. tostring(gc_err)))
-	log("loaded: locked Rack UPS Test (R500) can power eligible devices in the same rack Mount; respects device power switch, updates hover power label, and restores original controllers")
+	collectgarbage("stop")
+	log("loaded: locked Rack UPS Test or Mountable Tenabolt UPS2E (R500) can power eligible devices in the same rack Mount; respects device power switch, updates hover label, restores original controllers")
 end
 
 function on_game_state_ready()
+	collectgarbage("stop")
 	-- The old world's controllers have already been freed; discard wrappers.
-	links, last_rejection, last_mount_state, last_overlap_state = {}, {}, {}, {}
-	hover_patch, hover_signal_label_id, hover_signal_failed, hover_signal_busy = nil, nil, false, false
+	links, link_ids, tracked_link_ids = {}, {}, {}
+	last_rejection, last_mount_state = {}, {}
+	last_source_selection = {}
+	array_probe_sequence, array_probe_logged, array_probe_budget_reported = 0, 0, false
+	active_world_id = current_world_id()
+	hover_patch = nil
 	ready = true
 	scan_after = tick + START_DELAY
-	pcall(connect_hover_label_signal)
-	log("world ready; rack power scan starts after %d ticks", START_DELAY)
+	log("world ready id=%s; rack power scan starts after %d ticks",
+		tostring(active_world_id), START_DELAY)
 end
 
 function on_player_input(event)
@@ -606,32 +708,57 @@ function on_player_input(event)
 	local keycode = tonumber(gd.get(event, "keycode")) or 0
 	local physical_keycode = tonumber(gd.get(event, "physical_keycode")) or 0
 	if keycode == 70 or physical_keycode == 70 then
+		if not world_is_current() then return nil end
 		for _, device in ipairs(collect_devices()) do log_mount_state(device, "F_key", true) end
 	end
 	return nil
 end
 
 function on_save_export(_data)
-	if not next(links) then return end
-	local alive = {}
+	if #link_ids == 0 then return end
+	if not world_is_current() then return end
+	local alive, by_id = {}, {}
 	for _, device in ipairs(collect_devices()) do
 		local id = gd.id(device)
-		if id then alive[id] = true end
+		if id then alive[id], by_id[id] = true, device end
 	end
-	for id, link in pairs(links) do
-		link.restore_reason = "save requested; keeping virtual rack power out of saved state"
-		restore_link(link, alive)
-		links[id] = nil
+	local remaining, remaining_set = {}, {}
+	for i = #link_ids, 1, -1 do
+		local id = link_ids[i]
+		local link = links[id]
+		if link then
+			link.restore_reason = "save requested; keeping virtual rack power out of saved state"
+			if restore_link(link, alive, by_id) then
+				links[id] = nil
+			else
+				log("save export could not restore link target=%s; retaining link for retry", link.target_label)
+				remaining[#remaining + 1], remaining_set[id] = id, true
+			end
+		end
 	end
+	link_ids, tracked_link_ids = remaining, remaining_set
+end
+
+-- A GDObject finalizer can fault if its Godot node was freed. Keep automatic
+-- collection out of scans and drain wrappers only after tick work is finished.
+local function drain_heap()
+	collectgarbage("collect")
+	collectgarbage("stop")
 end
 
 function on_game_tick()
+	collectgarbage("stop")
 	tick = tick + 1
 	if ready and tick >= scan_after and tick % SCAN_PERIOD == 0 then
-		local ok, err = pcall(scan)
-		if not ok then log("scan failed safely: %s", tostring(err)) end
-		pcall(connect_hover_label_signal)
-		if next(links) or hover_patch then pcall(update_hover_power_text) end
+		if world_is_current() then
+			local ok, err = pcall(scan)
+			if not ok then log("scan failed safely: %s", tostring(err)) end
+		end
 	end
-	return nil
+	-- Poll instead of entering Lua from RichTextLabel.finished. Six ticks keeps
+	-- the corrected label responsive without a re-entrant signal callback.
+	if ready and tick >= scan_after and tick % 6 == 0 and world_is_current() then
+		pcall(update_hover_power_text)
+	end
+	return drain_heap()
 end

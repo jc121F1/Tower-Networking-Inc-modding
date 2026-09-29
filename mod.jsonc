@@ -4,9 +4,9 @@
 	"authors": [ "modding-kit" ],
 	"version": "0.1.0",
 	"description": [
-		"Test-only rack power bridge for the Rack UPS Test and FireWatch ES4A.",
-		"Transfers power only while both are locked into the same rack Mount.",
-		"Restores the FireWatch's original controller when the rack relationship ends."
+		"Test-only rack power bridge for the Rack UPS Test and stock Mountable Tenabolt UPS2E.",
+		"Transfers power only while the UPS and target are locked into the same rack Mount.",
+		"Restores original power controllers when the rack relationship ends."
 	],
 	"links": {},
 	"dependencies": {
