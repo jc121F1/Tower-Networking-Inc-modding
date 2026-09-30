@@ -5,6 +5,7 @@ local gd = require("lib.gd")
 local SCAN_PERIOD = 30
 local START_DELAY = 120
 local MIN_CHARGE_MULTIPLIER = 10
+local DEBUG_LOGGING = false -- Set true for mount, array, power, and hover probes.
 local tick, ready, scan_after = 0, false, math.huge
 local active_world_id = nil
 local links = {} -- target device id -> reversible transfer record
@@ -20,13 +21,18 @@ local array_probe_budget_reported = false
 local NODE_ARRAY_SAMPLE_PERIOD = 32
 
 local function log(fmt, ...)
-	print("[rack-ups-test] " .. string.format(fmt, ...))
+	if DEBUG_LOGGING then print("[rack-ups-test] " .. string.format(fmt, ...)) end
+end
+
+local function warn(fmt, ...)
+	print("[rack-ups-test] WARNING: " .. string.format(fmt, ...))
 end
 
 -- Emit a bounded checkpoint immediately before each Godot Array traversal.
 -- If the sandbox faults while iterating, the last checkpoint identifies the
 -- caller and owning object without dumping the array or retaining its entries.
 local function audit_array_iteration(site, owner, array, fn, detail)
+	if not DEBUG_LOGGING then return gd.each(array, fn) end
 	array_probe_sequence = array_probe_sequence + 1
 	local should_log = site ~= "node_children"
 		or array_probe_sequence <= 120
@@ -49,8 +55,8 @@ end
 
 local function is_ups_source(device)
 	local product = gd.get(device, "product_name")
-	return has(product, "rack ups test")
-		or has(product, "mountable tenabolt ups2e")
+	return has(product, "mountable tenabolt ups2e")
+		or has(product, "mountable tenabolt ups2h")
 end
 
 local function label(device)
@@ -59,6 +65,7 @@ local function label(device)
 end
 
 local function log_mount_state(device, reason, force)
+	if not DEBUG_LOGGING then return end
 	if not (is_ups_source(device) or gd.get(device, "logic_controller") ~= nil) then return end
 	local id = tostring(gd.id(device) or "?")
 	local area = gd.get(device, "base_mounted_area")
@@ -151,7 +158,7 @@ local function restore_power(item, source_alive)
 		pcall(function() original.add_local(power) end)
 		gd.set(power, "controller", original)
 		local ok, count, err = normalize_one_local(original, power)
-		if not ok then log("restore membership warning power=%s count=%d error=%s", tostring(gd.id(power)), count, tostring(err)) end
+		if not ok then warn("restore membership power=%s count=%d error=%s", tostring(gd.id(power)), count, tostring(err)) end
 	end
 	if source_alive then refresh(source) end
 	refresh(original)
@@ -184,7 +191,7 @@ local function resolve_link(link, by_id)
 				}
 			elseif not link.resolve_warned then
 				link.resolve_warned = true
-				log("link node resolution failed target=%s power=%s original_pc=%s",
+				warn("link node resolution failed target=%s power=%s original_pc=%s",
 					link.target_label, saved.power_id, saved.original_pc_id)
 			end
 		end
@@ -288,9 +295,11 @@ local function transfer_one(power, source_pc, original_pc)
 	local observed_controller = gd.get(power, "controller")
 	local controller_matches = gd.id(observed_controller) == gd.id(source_pc)
 	local local_registered = has_local(source_pc, power)
-	log("transfer membership power=%s original_count=%d source_count=%d controller_matches=%s",
-		tostring(gd.id(power)), local_count(original_pc, power),
-		local_count(source_pc, power), tostring(controller_matches))
+	if DEBUG_LOGGING then
+		log("transfer membership power=%s original_count=%d source_count=%d controller_matches=%s",
+			tostring(gd.id(power)), local_count(original_pc, power),
+			local_count(source_pc, power), tostring(controller_matches))
+	end
 	if not (controller_matches or local_registered) then
 		remove_all_locals(source_pc, power)
 		pcall(function() original_pc.add_local(power) end)
@@ -303,9 +312,11 @@ local function transfer_one(power, source_pc, original_pc)
 	-- the Power back-reference on its previous controller on this game build.
 	if not controller_matches then gd.set(power, "controller", source_pc) end
 	local membership_ok, membership_count, membership_err = normalize_one_local(source_pc, power)
-	log("post-controller membership power=%s source_count=%d controller=%s normalized=%s error=%s",
-		tostring(gd.id(power)), membership_count,
-		tostring(gd.id(gd.get(power, "controller"))), tostring(membership_ok), tostring(membership_err))
+	if DEBUG_LOGGING then
+		log("post-controller membership power=%s source_count=%d controller=%s normalized=%s error=%s",
+			tostring(gd.id(power)), membership_count,
+			tostring(gd.id(gd.get(power, "controller"))), tostring(membership_ok), tostring(membership_err))
+	end
 	if not membership_ok then
 		remove_all_locals(source_pc, power)
 		pcall(function() original_pc.add_local(power) end)
@@ -472,8 +483,10 @@ local function transfer_target(source, target, source_area)
 			original_powered = item.original_powered,
 		}
 		link.powers[#link.powers + 1] = item
-		log("load transfer target=%s source=%s %s source_memberships=%d", link.target_label,
-			link.source_label, snapshot(power, source_pc), local_count(source_pc, power))
+		if DEBUG_LOGGING then
+			log("load transfer target=%s source=%s %s source_memberships=%d", link.target_label,
+				link.source_label, snapshot(power, source_pc), local_count(source_pc, power))
+		end
 	end
 	local resolved_source, resolved_powers = resolve_link(link,
 		{ [link.target_id] = target, [link.source_id] = source })
@@ -492,6 +505,7 @@ local function transfer_target(source, target, source_area)
 end
 
 local function audit_link_load(link, by_id)
+	if not DEBUG_LOGGING then return end
 	local source_pc, powers = resolve_link(link, by_id)
 	if not source_pc or #powers ~= #link.powers then return end
 	local source_state = string.format("source_pc=%s current_load=%s displayed_load=%s charge=%s/%s rate=%s",
@@ -528,6 +542,7 @@ local function audit_link_load(link, by_id)
 end
 
 local function reject_once(key, message)
+	if not DEBUG_LOGGING then return end
 	if last_rejection[key] ~= message then
 		last_rejection[key] = message
 		log("preflight rejected key=%s reason=%s", key, message)
@@ -545,10 +560,11 @@ local function source_is_active(source)
 end
 
 local function select_source(matching, area_id)
-	local eligible, candidate_ids = {}, {}
+	local eligible, candidate_ids = {}, DEBUG_LOGGING and {} or nil
 	for _, source in ipairs(matching) do
-		local id = gd.id(source.device)
-		candidate_ids[#candidate_ids + 1] = tostring(id or "?")
+		if DEBUG_LOGGING then
+			candidate_ids[#candidate_ids + 1] = tostring(gd.id(source.device) or "?")
+		end
 		if source_is_active(source) then eligible[#eligible + 1] = source end
 	end
 	-- Device discovery order is usually stable, but sort explicitly so duplicated
@@ -557,15 +573,17 @@ local function select_source(matching, area_id)
 		return (tonumber(gd.id(a.device)) or math.huge) < (tonumber(gd.id(b.device)) or math.huge)
 	end)
 	local selected = eligible[1]
-	local signature = table.concat(candidate_ids, ",") .. "|selected="
-		.. tostring(selected and gd.id(selected.device) or "none")
-	local key = tostring(area_id or "?")
-	if #matching > 1 and last_source_selection[key] ~= signature then
-		log("multiple UPS devices in mount=%s candidates=[%s] eligible=%d selected=%s; other UPS units left idle",
-			key, table.concat(candidate_ids, ","), #eligible,
-			tostring(selected and gd.id(selected.device) or "none"))
+	if DEBUG_LOGGING then
+		local signature = table.concat(candidate_ids, ",") .. "|selected="
+			.. tostring(selected and gd.id(selected.device) or "none")
+		local key = tostring(area_id or "?")
+		if #matching > 1 and last_source_selection[key] ~= signature then
+			log("multiple UPS devices in mount=%s candidates=[%s] eligible=%d selected=%s; other UPS units left idle",
+				key, table.concat(candidate_ids, ","), #eligible,
+				tostring(selected and gd.id(selected.device) or "none"))
+		end
+		last_source_selection[key] = signature
 	end
-	last_source_selection[key] = signature
 	return selected
 end
 
@@ -704,6 +722,7 @@ function on_game_state_ready()
 end
 
 function on_player_input(event)
+	if not DEBUG_LOGGING then return nil end
 	if gd.get(event, "pressed") ~= true or gd.get(event, "echo") == true then return nil end
 	local keycode = tonumber(gd.get(event, "keycode")) or 0
 	local physical_keycode = tonumber(gd.get(event, "physical_keycode")) or 0
@@ -731,7 +750,7 @@ function on_save_export(_data)
 			if restore_link(link, alive, by_id) then
 				links[id] = nil
 			else
-				log("save export could not restore link target=%s; retaining link for retry", link.target_label)
+				warn("save export could not restore link target=%s; retaining link for retry", link.target_label)
 				remaining[#remaining + 1], remaining_set[id] = id, true
 			end
 		end
@@ -752,7 +771,7 @@ function on_game_tick()
 	if ready and tick >= scan_after and tick % SCAN_PERIOD == 0 then
 		if world_is_current() then
 			local ok, err = pcall(scan)
-			if not ok then log("scan failed safely: %s", tostring(err)) end
+			if not ok then warn("scan failed safely: %s", tostring(err)) end
 		end
 	end
 	-- Poll instead of entering Lua from RichTextLabel.finished. Six ticks keeps
