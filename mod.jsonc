@@ -1,10 +1,10 @@
 {
-	"id": "rack-ups-power-test",
-	"name": "Rack UPS Power Test",
-	"authors": [ "modding-kit" ],
+	"id": "ups-powered-rack",
+	"name": "Everything's UPS Powered Racks",
+	"authors": [ "Everything" ],
 	"version": "0.1.0",
 	"description": [
-		"Test-only rack power bridge for the Rack UPS Test and stock Mountable Tenabolt UPS2E.",
+		"Allows UPS mounted in a rack to power any other device in the rack.",
 		"Transfers power only while the UPS and target are locked into the same rack Mount.",
 		"Restores original power controllers when the rack relationship ends."
 	],

@@ -5,7 +5,24 @@ local gd = require("lib.gd")
 local SCAN_PERIOD = 30
 local START_DELAY = 120
 local MIN_CHARGE_MULTIPLIER = 10
+local HOVER_POLL_PERIOD = 6
+local HOVER_PARENT_STEPS = 7
+local LOCAL_MEMBERSHIP_MAX_ATTEMPTS = 8
+local DEBUG_F_KEYCODE = 70
 local DEBUG_LOGGING = false -- Set true for mount, array, power, and hover probes.
+-- Add one distinctive, lowercase product_name fragment per supported UPS.
+local SUPPORTED_UPS_PRODUCT_FRAGMENTS = {
+	"mountable tenabolt ups2e",
+	"mountable tenabolt ups2h",
+	"tenabolt ups2x"
+}
+local RACK_MOUNT_NAME = "Mount"
+local POWER_NODE_NAME = "Power"
+local LIGHT_NODE_FRAGMENT = "light"
+local SWITCH_NODE_FRAGMENT = "switch"
+local HOVER_UNPOWERED_TEXT = "Unpowered"
+local HOVER_UNPOWERED_BBCODE_PATTERN = "%[color=[^%]]+%]" .. HOVER_UNPOWERED_TEXT .. "%[/color%]"
+local HOVER_POWERED_BBCODE = "[color=green]Powered[/color]"
 local tick, ready, scan_after = 0, false, math.huge
 local active_world_id = nil
 local links = {} -- target device id -> reversible transfer record
@@ -17,15 +34,16 @@ local hover_patch = nil
 local array_probe_sequence = 0
 local array_probe_logged = 0
 local ARRAY_PROBE_BUDGET = 240
+local ARRAY_PROBE_FULL_WINDOW = 120
 local array_probe_budget_reported = false
 local NODE_ARRAY_SAMPLE_PERIOD = 32
 
 local function log(fmt, ...)
-	if DEBUG_LOGGING then print("[rack-ups-test] " .. string.format(fmt, ...)) end
+	if DEBUG_LOGGING then print("[ups-powered-racks] " .. string.format(fmt, ...)) end
 end
 
 local function warn(fmt, ...)
-	print("[rack-ups-test] WARNING: " .. string.format(fmt, ...))
+	print("[ups-powered-racks] WARNING: " .. string.format(fmt, ...))
 end
 
 -- Emit a bounded checkpoint immediately before each Godot Array traversal.
@@ -35,7 +53,7 @@ local function audit_array_iteration(site, owner, array, fn, detail)
 	if not DEBUG_LOGGING then return gd.each(array, fn) end
 	array_probe_sequence = array_probe_sequence + 1
 	local should_log = site ~= "node_children"
-		or array_probe_sequence <= 120
+		or array_probe_sequence <= ARRAY_PROBE_FULL_WINDOW
 		or array_probe_sequence % NODE_ARRAY_SAMPLE_PERIOD == 0
 	if should_log and array_probe_logged < ARRAY_PROBE_BUDGET then
 		array_probe_logged = array_probe_logged + 1
@@ -55,8 +73,10 @@ end
 
 local function is_ups_source(device)
 	local product = gd.get(device, "product_name")
-	return has(product, "mountable tenabolt ups2e")
-		or has(product, "mountable tenabolt ups2h")
+	for i = 1, #SUPPORTED_UPS_PRODUCT_FRAGMENTS do
+		if has(product, SUPPORTED_UPS_PRODUCT_FRAGMENTS[i]) then return true end
+	end
+	return false
 end
 
 local function label(device)
@@ -124,7 +144,7 @@ local function normalize_one_local(pc, power)
 		count = local_count(pc, power)
 	end
 	local attempts = 0
-	while count > 1 and attempts < 8 do
+	while count > 1 and attempts < LOCAL_MEMBERSHIP_MAX_ATTEMPTS do
 		local before = count
 		local ok, err = pcall(function() pc.remove_local(power) end)
 		if not ok then return false, count, tostring(err) end
@@ -139,7 +159,7 @@ end
 local function remove_all_locals(pc, power)
 	local attempts = 0
 	local count = local_count(pc, power)
-	while count > 0 and attempts < 8 do
+	while count > 0 and attempts < LOCAL_MEMBERSHIP_MAX_ATTEMPTS do
 		local before = count
 		local ok, err = pcall(function() pc.remove_local(power) end)
 		if not ok then return false, count, tostring(err) end
@@ -237,7 +257,7 @@ local function update_hover_power_text()
 		return
 	end
 	local device = hovered
-	for _ = 1, 7 do
+	for _ = 1, HOVER_PARENT_STEPS do
 		if not device or gd.get(device, "logic_controller") ~= nil
 			or gd.get(device, "power_controller") ~= nil then break end
 		device = gd.parent(device)
@@ -262,12 +282,12 @@ local function update_hover_power_text()
 		hover_patch = nil
 		return
 	end
-	if string.find(text, "Unpowered", 1, true) then
+	if string.find(text, HOVER_UNPOWERED_TEXT, 1, true) then
 		if gd.get(hover_label, "bbcode_enabled") ~= true then return end
 		local patched, count = string.gsub(text,
-			"%[color=[^%]]+%]Unpowered%[/color%]", "[color=green]Powered[/color]", 1)
+			HOVER_UNPOWERED_BBCODE_PATTERN, HOVER_POWERED_BBCODE, 1)
 		if count == 0 then
-			patched = string.gsub(text, "Unpowered", "[color=green]Powered[/color]", 1)
+			patched = string.gsub(text, HOVER_UNPOWERED_TEXT, HOVER_POWERED_BBCODE, 1)
 		end
 		gd.set(hover_label, "text", patched)
 		hover_patch = { device_id = device_id, original = text, patched = patched }
@@ -402,8 +422,8 @@ local function find_power_nodes(device, source_pc)
 		local node = pending[#pending]
 		pending[#pending] = nil
 		local name = gd.name(node)
-		if name == "Power" then add(node)
-		elseif has(name, "light") or has(name, "switch") then add(gd.get(node, "power")) end
+		if name == POWER_NODE_NAME then add(node)
+		elseif has(name, LIGHT_NODE_FRAGMENT) or has(name, SWITCH_NODE_FRAGMENT) then add(gd.get(node, "power")) end
 		audit_array_iteration("node_children", node, gd.call(node, "get_children"),
 			function(_, child) pending[#pending + 1] = child end)
 	end
@@ -445,7 +465,9 @@ local function transfer_target(source, target, source_area)
 	local charges = tonumber(gd.get(source_pc, "charges")) or 0
 	if watts <= 0 or not source_rate then return nil, "unknown load or UPS output rate" end
 	if watts > source_rate or current_load + watts > source_rate then return nil, "estimated load exceeds UPS output rate" end
-	if charges < watts * MIN_CHARGE_MULTIPLIER then return nil, "UPS charge below 10x estimated load reserve" end
+	if charges < watts * MIN_CHARGE_MULTIPLIER then
+		return nil, string.format("UPS charge below %dx estimated load reserve", MIN_CHARGE_MULTIPLIER)
+	end
 	-- Resolve paths before changing any controller. NodePath results are Lua
 	-- strings in this bridge, and remain relative to the target if it moves.
 	local prepared = {}
@@ -596,7 +618,7 @@ local function scan()
 		if id then alive[id], by_id[id] = true, device end
 		log_mount_state(device, "scan", false)
 		local area = gd.get(device, "base_mounted_area")
-		if area and gd.name(area) == "Mount" then
+		if area and gd.name(area) == RACK_MOUNT_NAME then
 			local area_id = gd.id(area)
 			if is_ups_source(device) then
 				sources[#sources + 1] = { device = device, area = area, area_id = area_id }
@@ -703,7 +725,7 @@ end
 
 function on_mod_load()
 	collectgarbage("stop")
-	log("loaded: locked Rack UPS Test or Mountable Tenabolt UPS2E (R500) can power eligible devices in the same rack Mount; respects device power switch, updates hover label, restores original controllers")
+	log("loaded: supported locked UPS can power eligible devices in the same rack Mount; respects device power switch, updates hover label, restores original controllers")
 end
 
 function on_game_state_ready()
@@ -726,7 +748,7 @@ function on_player_input(event)
 	if gd.get(event, "pressed") ~= true or gd.get(event, "echo") == true then return nil end
 	local keycode = tonumber(gd.get(event, "keycode")) or 0
 	local physical_keycode = tonumber(gd.get(event, "physical_keycode")) or 0
-	if keycode == 70 or physical_keycode == 70 then
+	if keycode == DEBUG_F_KEYCODE or physical_keycode == DEBUG_F_KEYCODE then
 		if not world_is_current() then return nil end
 		for _, device in ipairs(collect_devices()) do log_mount_state(device, "F_key", true) end
 	end
@@ -774,9 +796,9 @@ function on_game_tick()
 			if not ok then warn("scan failed safely: %s", tostring(err)) end
 		end
 	end
-	-- Poll instead of entering Lua from RichTextLabel.finished. Six ticks keeps
+	-- Poll instead of entering Lua from RichTextLabel.finished. This interval keeps
 	-- the corrected label responsive without a re-entrant signal callback.
-	if ready and tick >= scan_after and tick % 6 == 0 and world_is_current() then
+	if ready and tick >= scan_after and tick % HOVER_POLL_PERIOD == 0 and world_is_current() then
 		pcall(update_hover_power_text)
 	end
 	return drain_heap()
