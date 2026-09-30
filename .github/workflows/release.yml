@@ -25,5 +25,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            "dist/ups-powerered-racks-${GITHUB_REF_NAME}.zip" \
+            "dist/ups-powered-racks-${GITHUB_REF_NAME}.zip" \
             --generate-notes
